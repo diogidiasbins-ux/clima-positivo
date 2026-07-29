@@ -231,19 +231,56 @@ def estoque():
     db.close()
     return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_ESTOQUE), active='estoque', itens_estoque=itens_estoque)
 
-@app.route('/obras', methods=['GET', 'POST'])
-def obras():
+@app.route('/sobras', methods=['GET', 'POST'])
+def sobras():
     if 'user' not in session: return redirect(url_for('login'))
     db = get_db()
+    cursor = db.cursor()
     if request.method == 'POST':
-        nome = request.form.get('nome')
-        local = request.form.get('localizacao')
-        db.execute("INSERT INTO obras (nome, localizacao) VALUES (?, ?)", (nome, local))
+        empregado = session['nome']
+        material = request.form.get('material').strip()
+        qtd = float(request.form.get('quantidade'))
+        unidade = request.form.get('unidade', 'unidades')
+        local = request.form.get('localizacao_atual')
+        data_hora = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Verificar se já existe este material disponível no mesmo local
+        if DATABASE_URL:
+            cursor.execute("SELECT id, quantidade FROM sobras WHERE material = %s AND unidade = %s AND localizacao_atual = %s AND estado = 'Disponível'", (material, unidade, local))
+        else:
+            cursor.execute("SELECT id, quantidade FROM sobras WHERE material = ? AND unidade = ? AND localizacao_atual = ? AND estado = 'Disponível'", (material, unidade, local))
+        existente = cursor.fetchone()
+        
+        if existente:
+            # Se já existe, soma à quantidade atual do registo existente
+            novo_total = existente['quantidade'] + qtd
+            reg_id = existente['id']
+            if DATABASE_URL:
+                cursor.execute("UPDATE sobras SET quantidade = %s, data_hora = %s WHERE id = %s", (novo_total, data_hora, reg_id))
+            else:
+                cursor.execute("UPDATE sobras SET quantidade = ?, data_hora = ? WHERE id = ?", (novo_total, data_hora, reg_id))
+        else:
+            # Se não existe, cria um novo registo normal
+            if DATABASE_URL:
+                cursor.execute("INSERT INTO sobras (data_hora, nome_empregado, material, quantidade, unidade, localizacao_atual, estado) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                               (data_hora, empregado, material, qtd, unidade, local, 'Disponível'))
+            else:
+                cursor.execute("INSERT INTO sobras (data_hora, nome_empregado, material, quantidade, unidade, localizacao_atual, estado) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (data_hora, empregado, material, qtd, unidade, local, 'Disponível'))
         db.commit()
-        return redirect(url_for('obras'))
-    todas_obras = db.execute("SELECT * FROM obras ORDER BY id DESC").fetchall()
+        db.close()
+        return redirect(url_for('sobras'))
+        
+    if DATABASE_URL:
+        cursor.execute("SELECT * FROM sobras WHERE estado = 'Disponível' ORDER BY id DESC")
+    else:
+        cursor.execute("SELECT * FROM sobras WHERE estado = 'Disponível' ORDER BY id DESC")
+    todas_sobras = cursor.fetchall()
+    
+    cursor.execute("SELECT * FROM obras ORDER BY nome")
+    todas_obras = cursor.fetchall()
     db.close()
-    return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_OBRAS), active='obras', obras=todas_obras)
+    return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_SOBRAS), active='sobras', sobras=todas_sobras, obras=todas_obras)
 
 @app.route('/obras/editar/<int:id>', methods=['POST'])
 def editar_obra(id):
