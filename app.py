@@ -3,11 +3,17 @@ import shutil
 import csv
 from io import StringIO
 from flask import Flask, render_template_string, request, redirect, url_for, flash, session, Response
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = 'clima_positivo_segredo_super_seguro'
+
+# Configuração da Base de Dados (Compatível com PostgreSQL do Supabase e fallback para SQLite local)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 DB_NAME = 'stock_manager.db'
 
@@ -52,7 +58,7 @@ FR_DICT = {
     'Disponível': 'Disponible',
     'Nenhum material em estoque.': 'Aucun matériel en stock.',
     'Registo de Entradas e Saídas': 'Registre des Entrées et Sorties',
-    'Modo Funcionário Ativo': 'Mode Employé Actif',
+    'Mode Funcionário Ativo': 'Mode Employé Actif',
     'Novo Movimento de Material': 'Nouveau Mouvement de Matériel',
     'Tipo de Movimento': 'Type de Mouvement',
     'Entrada': 'Entrée',
@@ -114,62 +120,73 @@ def inject_translator():
         return word
     return dict(t=t, lang=lang)
 
-def fazer_backup():
-    if os.path.exists(DB_NAME):
-        backup_dir = 'backups'
-        if not os.path.exists(backup_dir):
-            os.makedirs(backup_dir)
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        backup_path = os.path.join(backup_dir, f'stock_backup_{timestamp}.db')
-        try:
-            shutil.copy2(DB_NAME, backup_path)
-        except Exception as e:
-            print(f" [AVISO] Falha ao criar backup: {e}")
+def get_db():
+    if DATABASE_URL:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        return conn
+    else:
+        import sqlite3
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def init_db():
-    fazer_backup()
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db()
     cursor = conn.cursor()
     
-    cursor.execute('''CREATE TABLE IF NOT EXISTS obras (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, localizacao TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS movimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data_hora TEXT NOT NULL, tipo_movimento TEXT NOT NULL, nome_empregado TEXT NOT NULL, codigo_produto TEXT DEFAULT '', nome_material TEXT NOT NULL, quantidade REAL NOT NULL, unidade TEXT NOT NULL DEFAULT 'unidades', stock_minimo REAL DEFAULT 5, obra TEXT NOT NULL)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS sobras (id INTEGER PRIMARY KEY AUTOINCREMENT, data_hora TEXT NOT NULL, nome_empregado TEXT NOT NULL, material TEXT NOT NULL, quantidade REAL NOT NULL, unidade TEXT NOT NULL DEFAULT 'unidades', localizacao_atual TEXT NOT NULL, estado TEXT NOT NULL)''')
+    if DATABASE_URL:
+        cursor.execute('''CREATE TABLE IF NOT EXISTS obras (id SERIAL PRIMARY KEY, nome TEXT NOT NULL, localizacao TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS movimentos (id SERIAL PRIMARY KEY, data_hora TEXT NOT NULL, tipo_movimento TEXT NOT NULL, nome_empregado TEXT NOT NULL, codigo_produto TEXT DEFAULT '', nome_material TEXT NOT NULL, quantidade REAL NOT NULL, unidade TEXT NOT NULL DEFAULT 'unidades', stock_minimo REAL DEFAULT 5, obra TEXT NOT NULL)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS sobras (id SERIAL PRIMARY KEY, data_hora TEXT NOT NULL, nome_empregado TEXT NOT NULL, material TEXT NOT NULL, quantidade REAL NOT NULL, unidade TEXT NOT NULL DEFAULT 'unidades', localizacao_atual TEXT NOT NULL, estado TEXT NOT NULL)''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS utilizadores (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                senha TEXT NOT NULL,
+                nome TEXT NOT NULL,
+                perfil TEXT NOT NULL,
+                estado TEXT DEFAULT 'Ativo'
+            )
+        ''')
+    else:
+        cursor.execute('''CREATE TABLE IF NOT EXISTS obras (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, localizacao TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS movimentos (id INTEGER PRIMARY KEY AUTOINCREMENT, data_hora TEXT NOT NULL, tipo_movimento TEXT NOT NULL, nome_empregado TEXT NOT NULL, codigo_produto TEXT DEFAULT '', nome_material TEXT NOT NULL, quantidade REAL NOT NULL, unidade TEXT NOT NULL DEFAULT 'unidades', stock_minimo REAL DEFAULT 5, obra TEXT NOT NULL)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS sobras (id INTEGER PRIMARY KEY AUTOINCREMENT, data_hora TEXT NOT NULL, nome_empregado TEXT NOT NULL, material TEXT NOT NULL, quantidade REAL NOT NULL, unidade TEXT NOT NULL DEFAULT 'unidades', localizacao_atual TEXT NOT NULL, estado TEXT NOT NULL)''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS utilizadores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                senha TEXT NOT NULL,
+                nome TEXT NOT NULL,
+                perfil TEXT NOT NULL,
+                estado TEXT DEFAULT 'Ativo'
+            )
+        ''')
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS utilizadores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            senha TEXT NOT NULL,
-            nome TEXT NOT NULL,
-            perfil TEXT NOT NULL,
-            estado TEXT DEFAULT 'Ativo'
-        )
-    ''')
-    
-    cursor.execute("PRAGMA table_info(utilizadores)")
-    colunas = [col[1] for col in cursor.fetchall()]
-    if 'estado' not in colunas:
-        cursor.execute("ALTER TABLE utilizadores ADD COLUMN estado TEXT DEFAULT 'Ativo'")
-
-    if cursor.execute("SELECT COUNT(*) FROM obras").fetchone()[0] == 0:
-        cursor.execute("INSERT INTO obras (nome, localizacao) VALUES ('Armazém Central', 'Sede')")
+    cursor.execute("SELECT COUNT(*) as count FROM obras")
+    res = cursor.fetchone()
+    count_obras = res['count'] if DATABASE_URL else res[0]
+    if count_obras == 0:
+        cursor.execute("INSERT INTO obras (nome, localizacao) VALUES (%s, %s)" if DATABASE_URL else "INSERT INTO obras (nome, localizacao) VALUES (?, ?)", ('Armazém Central', 'Sede'))
         
-    if cursor.execute("SELECT COUNT(*) FROM utilizadores").fetchone()[0] == 0:
+    cursor.execute("SELECT COUNT(*) as count FROM utilizadores")
+    res_u = cursor.fetchone()
+    count_users = res_u['count'] if DATABASE_URL else res_u[0]
+    if count_users == 0:
         default_users = [
             ('admin', 'admin123', 'Administrador', 'admin', 'Ativo'),
             ('gustavo', 'obra123', 'Gustavo', 'funcionario', 'Ativo'),
             ('diogo', 'obra123', 'Diogo', 'funcionario', 'Ativo'),
             ('lara', 'obra123', 'Lara', 'funcionario', 'Ativo')
         ]
-        cursor.executemany("INSERT OR IGNORE INTO utilizadores (username, senha, nome, perfil, estado) VALUES (?, ?, ?, ?, ?)", default_users)
+        if DATABASE_URL:
+            for u in default_users:
+                cursor.execute("INSERT INTO utilizadores (username, senha, nome, perfil, estado) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (username) DO NOTHING", u)
+        else:
+            cursor.executemany("INSERT OR IGNORE INTO utilizadores (username, senha, nome, perfil, estado) VALUES (?, ?, ?, ?, ?)", default_users)
         
     conn.commit()
     conn.close()
-
-def get_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 @app.route('/lang/<idioma>')
 def set_lang(idioma):
@@ -182,7 +199,12 @@ def login():
         username = request.form.get('username', '').strip().lower()
         senha = request.form.get('senha', '')
         db = get_db()
-        user = db.execute("SELECT * FROM utilizadores WHERE username = ? AND senha = ?", (username, senha)).fetchone()
+        cursor = db.cursor()
+        if DATABASE_URL:
+            cursor.execute("SELECT * FROM utilizadores WHERE username = %s AND senha = %s", (username, senha))
+        else:
+            cursor.execute("SELECT * FROM utilizadores WHERE username = ? AND senha = ?", (username, senha))
+        user = cursor.fetchone()
         db.close()
         if user:
             if user['estado'] == 'Bloqueado':
@@ -205,14 +227,34 @@ def logout():
 def index():
     if 'user' not in session: return redirect(url_for('login'))
     db = get_db()
-    total_materiais = db.execute("SELECT COUNT(DISTINCT nome_material) as count FROM movimentos").fetchone()['count'] or 0
+    cursor = db.cursor()
+    
+    cursor.execute("SELECT COUNT(DISTINCT nome_material) as count FROM movimentos")
+    total_materiais = cursor.fetchone()['count'] or 0
+    
     today_str = datetime.now().strftime('%Y-%m-%d')
-    entradas_hoje = db.execute("SELECT COUNT(*) as count FROM movimentos WHERE tipo_movimento = 'Entrada' AND data_hora LIKE ?", (f"{today_str}%",)).fetchone()['count']
-    saidas_hoje = db.execute("SELECT COUNT(*) as count FROM movimentos WHERE tipo_movimento = 'Saída' AND data_hora LIKE ?", (f"{today_str}%",)).fetchone()['count']
-    sobras_disp = db.execute("SELECT COUNT(*) as count FROM sobras WHERE estado = 'Disponível'").fetchone()['count'] or 0
-    ultimos_movimentos = db.execute("SELECT * FROM movimentos ORDER BY id DESC LIMIT 5").fetchall()
-    sobras_recentes = db.execute("SELECT * FROM sobras WHERE estado = 'Disponível' ORDER BY id DESC LIMIT 5").fetchall()
+    if DATABASE_URL:
+        cursor.execute("SELECT COUNT(*) as count FROM movimentos WHERE tipo_movimento = 'Entrada' AND data_hora LIKE %s", (f"{today_str}%",))
+    else:
+        cursor.execute("SELECT COUNT(*) as count FROM movimentos WHERE tipo_movimento = 'Entrada' AND data_hora LIKE ?", (f"{today_str}%",))
+    entradas_hoje = cursor.fetchone()['count']
+    
+    if DATABASE_URL:
+        cursor.execute("SELECT COUNT(*) as count FROM movimentos WHERE tipo_movimento = 'Saída' AND data_hora LIKE %s", (f"{today_str}%",))
+    else:
+        cursor.execute("SELECT COUNT(*) as count FROM movimentos WHERE tipo_movimento = 'Saída' AND data_hora LIKE ?", (f"{today_str}%",))
+    saidas_hoje = cursor.fetchone()['count']
+    
+    cursor.execute("SELECT COUNT(*) as count FROM sobras WHERE estado = 'Disponível'")
+    sobras_disp = cursor.fetchone()['count'] or 0
+    
+    cursor.execute("SELECT * FROM movimentos ORDER BY id DESC LIMIT 5")
+    ultimos_movimentos = cursor.fetchall()
+    
+    cursor.execute("SELECT * FROM sobras WHERE estado = 'Disponível' ORDER BY id DESC LIMIT 5")
+    sobras_recentes = cursor.fetchall()
     db.close()
+    
     return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_DASHBOARD), active='dashboard', 
                                   total_materiais=total_materiais, entradas_hoje=entradas_hoje, saidas_hoje=saidas_hoje, 
                                   sobras_disp=sobras_disp, ultimos_movimentos=ultimos_movimentos, sobras_recentes=sobras_recentes)
@@ -221,13 +263,15 @@ def index():
 def estoque():
     if 'user' not in session: return redirect(url_for('login'))
     db = get_db()
+    cursor = db.cursor()
     query = """
         SELECT codigo_produto, nome_material, unidade,
                COALESCE(MAX(stock_minimo), 5) as stock_minimo,
                COALESCE(SUM(CASE WHEN tipo_movimento = 'Entrada' THEN quantidade ELSE -quantidade END), 0) as saldo_atual
-        FROM movimentos GROUP BY codigo_produto, nome_material, unidade HAVING saldo_atual > 0
+        FROM movimentos GROUP BY codigo_produto, nome_material, unidade HAVING SUM(CASE WHEN tipo_movimento = 'Entrada' THEN quantidade ELSE -quantidade END) > 0
     """
-    itens_estoque = db.execute(query).fetchall()
+    cursor.execute(query)
+    itens_estoque = cursor.fetchall()
     db.close()
     return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_ESTOQUE), active='estoque', itens_estoque=itens_estoque)
 
@@ -235,13 +279,19 @@ def estoque():
 def obras():
     if 'user' not in session: return redirect(url_for('login'))
     db = get_db()
+    cursor = db.cursor()
     if request.method == 'POST':
         nome = request.form.get('nome')
         local = request.form.get('localizacao')
-        db.execute("INSERT INTO obras (nome, localizacao) VALUES (?, ?)", (nome, local))
+        if DATABASE_URL:
+            cursor.execute("INSERT INTO obras (nome, localizacao) VALUES (%s, %s)", (nome, local))
+        else:
+            cursor.execute("INSERT INTO obras (nome, localizacao) VALUES (?, ?)", (nome, local))
         db.commit()
+        db.close()
         return redirect(url_for('obras'))
-    todas_obras = db.execute("SELECT * FROM obras ORDER BY id DESC").fetchall()
+    cursor.execute("SELECT * FROM obras ORDER BY id DESC")
+    todas_obras = cursor.fetchall()
     db.close()
     return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_OBRAS), active='obras', obras=todas_obras)
 
@@ -251,7 +301,11 @@ def editar_obra(id):
     novo_nome = request.form.get('nome')
     nova_localizacao = request.form.get('localizacao')
     db = get_db()
-    db.execute("UPDATE obras SET nome = ?, localizacao = ? WHERE id = ?", (novo_nome, nova_localizacao, id))
+    cursor = db.cursor()
+    if DATABASE_URL:
+        cursor.execute("UPDATE obras SET nome = %s, localizacao = %s WHERE id = %s", (novo_nome, nova_localizacao, id))
+    else:
+        cursor.execute("UPDATE obras SET nome = ?, localizacao = ? WHERE id = ?", (novo_nome, nova_localizacao, id))
     db.commit()
     db.close()
     return redirect(url_for('obras'))
@@ -261,18 +315,24 @@ def funcionarios():
     if 'user' not in session or session['perfil'] != 'admin': 
         return redirect(url_for('index'))
     db = get_db()
+    cursor = db.cursor()
     if request.method == 'POST':
         username = request.form.get('username').strip().lower()
         senha = request.form.get('senha')
         nome = request.form.get('nome')
         perfil = request.form.get('perfil')
         try:
-            db.execute("INSERT INTO utilizadores (username, senha, nome, perfil, estado) VALUES (?, ?, ?, ?, 'Ativo')", (username, senha, nome, perfil))
+            if DATABASE_URL:
+                cursor.execute("INSERT INTO utilizadores (username, senha, nome, perfil, estado) VALUES (%s, %s, %s, %s, 'Ativo')", (username, senha, nome, perfil))
+            else:
+                cursor.execute("INSERT INTO utilizadores (username, senha, nome, perfil, estado) VALUES (?, ?, ?, ?, 'Ativo')", (username, senha, nome, perfil))
             db.commit()
-        except sqlite3.IntegrityError:
+        except Exception:
             pass
+        db.close()
         return redirect(url_for('funcionarios'))
-    todos_funcs = db.execute("SELECT * FROM utilizadores ORDER BY id DESC").fetchall()
+    cursor.execute("SELECT * FROM utilizadores ORDER BY id DESC")
+    todos_funcs = cursor.fetchall()
     db.close()
     return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_FUNCIONARIOS), active='funcionarios', funcionarios=todos_funcs)
 
@@ -283,7 +343,11 @@ def editar_funcionario(id):
     novo_nome = request.form.get('nome')
     novo_perfil = request.form.get('perfil')
     db = get_db()
-    db.execute("UPDATE utilizadores SET username = ?, nome = ?, perfil = ? WHERE id = ?", (novo_user, novo_nome, novo_perfil, id))
+    cursor = db.cursor()
+    if DATABASE_URL:
+        cursor.execute("UPDATE utilizadores SET username = %s, nome = %s, perfil = %s WHERE id = %s", (novo_user, novo_nome, novo_perfil, id))
+    else:
+        cursor.execute("UPDATE utilizadores SET username = ?, nome = ?, perfil = ? WHERE id = ?", (novo_user, novo_nome, novo_perfil, id))
     db.commit()
     db.close()
     return redirect(url_for('funcionarios'))
@@ -292,10 +356,18 @@ def editar_funcionario(id):
 def alterar_status_funcionario(id):
     if 'user' not in session or session['perfil'] != 'admin': return redirect(url_for('index'))
     db = get_db()
-    user = db.execute("SELECT * FROM utilizadores WHERE id = ?", (id,)).fetchone()
+    cursor = db.cursor()
+    if DATABASE_URL:
+        cursor.execute("SELECT * FROM utilizadores WHERE id = %s", (id,))
+    else:
+        cursor.execute("SELECT * FROM utilizadores WHERE id = ?", (id,))
+    user = cursor.fetchone()
     if user and user['username'] != 'admin':
         novo_estado = 'Bloqueado' if user['estado'] == 'Ativo' else 'Ativo'
-        db.execute("UPDATE utilizadores SET estado = ? WHERE id = ?", (novo_estado, id))
+        if DATABASE_URL:
+            cursor.execute("UPDATE utilizadores SET estado = %s WHERE id = %s", (novo_estado, id))
+        else:
+            cursor.execute("UPDATE utilizadores SET estado = ? WHERE id = ?", (novo_estado, id))
         db.commit()
     db.close()
     return redirect(url_for('funcionarios'))
@@ -306,7 +378,11 @@ def alterar_senha_funcionario(id):
     nova_senha = request.form.get('nova_senha')
     if nova_senha:
         db = get_db()
-        db.execute("UPDATE utilizadores SET senha = ? WHERE id = ?", (nova_senha, id))
+        cursor = db.cursor()
+        if DATABASE_URL:
+            cursor.execute("UPDATE utilizadores SET senha = %s WHERE id = %s", (nova_senha, id))
+        else:
+            cursor.execute("UPDATE utilizadores SET senha = ? WHERE id = ?", (nova_senha, id))
         db.commit()
         db.close()
     return redirect(url_for('funcionarios'))
@@ -315,6 +391,7 @@ def alterar_senha_funcionario(id):
 def movimentos():
     if 'user' not in session: return redirect(url_for('login'))
     db = get_db()
+    cursor = db.cursor()
     if request.method == 'POST':
         tipo = 'Saída' if session['perfil'] == 'funcionario' else request.form.get('tipo_movimento')
         empregado = session['nome'] if session['perfil'] == 'funcionario' else (request.form.get('nome_empregado') or session['nome'])
@@ -325,12 +402,21 @@ def movimentos():
         stock_minimo = float(request.form.get('stock_minimo', 5))
         obra = request.form.get('obra')
         data_hora = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        db.execute("INSERT INTO movimentos (data_hora, tipo_movimento, nome_empregado, codigo_produto, nome_material, quantidade, unidade, stock_minimo, obra) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                   (data_hora, tipo, empregado, codigo, material, qtd, unidade, stock_minimo, obra))
+        
+        if DATABASE_URL:
+            cursor.execute("INSERT INTO movimentos (data_hora, tipo_movimento, nome_empregado, codigo_produto, nome_material, quantidade, unidade, stock_minimo, obra) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                           (data_hora, tipo, empregado, codigo, material, qtd, unidade, stock_minimo, obra))
+        else:
+            cursor.execute("INSERT INTO movimentos (data_hora, tipo_movimento, nome_empregado, codigo_produto, nome_material, quantidade, unidade, stock_minimo, obra) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (data_hora, tipo, empregado, codigo, material, qtd, unidade, stock_minimo, obra))
         db.commit()
+        db.close()
         return redirect(url_for('movimentos'))
-    todos_movimentos = db.execute("SELECT * FROM movimentos ORDER BY id DESC").fetchall()
-    todas_obras = db.execute("SELECT * FROM obras ORDER BY nome").fetchall()
+        
+    cursor.execute("SELECT * FROM movimentos ORDER BY id DESC")
+    todos_movimentos = cursor.fetchall()
+    cursor.execute("SELECT * FROM obras ORDER BY nome")
+    todas_obras = cursor.fetchall()
     db.close()
     return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_MOVIMENTOS), active='movimentos', movimentos=todos_movimentos, obras=todas_obras)
 
@@ -338,7 +424,9 @@ def movimentos():
 def exportar():
     if 'user' not in session: return redirect(url_for('login'))
     db = get_db()
-    movimentos = db.execute("SELECT * FROM movimentos ORDER BY id DESC").fetchall()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM movimentos ORDER BY id DESC")
+    movimentos = cursor.fetchall()
     db.close()
     si = StringIO()
     cw = csv.writer(si, delimiter=';')
@@ -352,6 +440,7 @@ def exportar():
 def sobras():
     if 'user' not in session: return redirect(url_for('login'))
     db = get_db()
+    cursor = db.cursor()
     if request.method == 'POST':
         empregado = session['nome']
         material = request.form.get('material')
@@ -359,12 +448,19 @@ def sobras():
         unidade = request.form.get('unidade', 'unidades')
         local = request.form.get('localizacao_atual')
         data_hora = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        db.execute("INSERT INTO sobras (data_hora, nome_empregado, material, quantidade, unidade, localizacao_atual, estado) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                   (data_hora, empregado, material, qtd, unidade, local, 'Disponível'))
+        if DATABASE_URL:
+            cursor.execute("INSERT INTO sobras (data_hora, nome_empregado, material, quantidade, unidade, localizacao_atual, estado) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                           (data_hora, empregado, material, qtd, unidade, local, 'Disponível'))
+        else:
+            cursor.execute("INSERT INTO sobras (data_hora, nome_empregado, material, quantidade, unidade, localizacao_atual, estado) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (data_hora, empregado, material, qtd, unidade, local, 'Disponível'))
         db.commit()
+        db.close()
         return redirect(url_for('sobras'))
-    todas_sobras = db.execute("SELECT * FROM sobras ORDER BY id DESC").fetchall()
-    todas_obras = db.execute("SELECT * FROM obras ORDER BY nome").fetchall()
+    cursor.execute("SELECT * FROM sobras ORDER BY id DESC")
+    todas_sobras = cursor.fetchall()
+    cursor.execute("SELECT * FROM obras ORDER BY nome")
+    todas_obras = cursor.fetchall()
     db.close()
     return render_template_string(HTML_LAYOUT.replace('<!--CONTENT-->', HTML_SOBRAS), active='sobras', sobras=todas_sobras, obras=todas_obras)
 
@@ -372,20 +468,36 @@ def sobras():
 def usar_sobra(id):
     if 'user' not in session: return redirect(url_for('login'))
     db = get_db()
-    sobra = db.execute("SELECT * FROM sobras WHERE id = ?", (id,)).fetchone()
+    cursor = db.cursor()
+    if DATABASE_URL:
+        cursor.execute("SELECT * FROM sobras WHERE id = %s", (id,))
+    else:
+        cursor.execute("SELECT * FROM sobras WHERE id = ?", (id,))
+    sobra = cursor.fetchone()
     if sobra:
         qtd_retirar = float(request.form.get('quantidade_retirar', sobra['quantidade']))
         obra_destino = request.form.get('obra_destino', 'Obra Geral')
         data_hora = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if qtd_retirar >= sobra['quantidade']:
-            db.execute("UPDATE sobras SET estado = 'Utilizado' WHERE id = ?", (id,))
+            if DATABASE_URL:
+                cursor.execute("UPDATE sobras SET estado = 'Utilizado' WHERE id = %s", (id,))
+            else:
+                cursor.execute("UPDATE sobras SET estado = 'Utilizado' WHERE id = ?", (id,))
             qtd_efetiva = sobra['quantidade']
         else:
             nova_qtd = sobra['quantidade'] - qtd_retirar
-            db.execute("UPDATE sobras SET quantidade = ? WHERE id = ?", (nova_qtd, id))
+            if DATABASE_URL:
+                cursor.execute("UPDATE sobras SET quantidade = %s WHERE id = %s", (nova_qtd, id))
+            else:
+                cursor.execute("UPDATE sobras SET quantidade = ? WHERE id = ?", (nova_qtd, id))
             qtd_efetiva = qtd_retirar
-        db.execute("INSERT INTO movimentos (data_hora, tipo_movimento, nome_empregado, codigo_produto, nome_material, quantidade, unidade, stock_minimo, obra) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                   (data_hora, 'Saída', session['nome'], 'SOBRA', sobra['material'], qtd_efetiva, sobra['unidade'], 0, obra_destino))
+            
+        if DATABASE_URL:
+            cursor.execute("INSERT INTO movimentos (data_hora, tipo_movimento, nome_empregado, codigo_produto, nome_material, quantidade, unidade, stock_minimo, obra) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                           (data_hora, 'Saída', session['nome'], 'SOBRA', sobra['material'], qtd_efetiva, sobra['unidade'], 0, obra_destino))
+        else:
+            cursor.execute("INSERT INTO movimentos (data_hora, tipo_movimento, nome_empregado, codigo_produto, nome_material, quantidade, unidade, stock_minimo, obra) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (data_hora, 'Saída', session['nome'], 'SOBRA', sobra['material'], qtd_efetiva, sobra['unidade'], 0, obra_destino))
         db.commit()
     db.close()
     return redirect(url_for('sobras'))
